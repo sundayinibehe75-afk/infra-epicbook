@@ -1,19 +1,351 @@
-# Starter pipeline
-# Start with a minimal pipeline that you can customize to build and deploy your code.
-# Add steps that build, run tests, deploy, and more:
-# https://aka.ms/yaml
+# EpicBook - Azure infrastructure pipeline (Terraform)
+#
+# Validate -> Plan -> Apply (manual approval) -> Outputs
+#
+# Every Terraform command runs inside an AzureCLI@2 task so that the service
+# connection's identity is available; no Marketplace extensions are used.
 
 trigger:
-- main
+  branches:
+    include:
+    - main
+  paths:
+    include:
+    - terraform/**            # terraform/* plus nested folders (terraform/modules/...)
+    - azure-pipelines.yml
 
+# Self-hosted Ubuntu agent (no Microsoft-hosted vmImage). Replace the placeholder.
 pool:
-  vmImage: ubuntu-latest
+  name: StaticSiteAgentPool
 
-steps:
-- script: echo Hello, world!
-  displayName: 'Run a one-line script'
+variables:
+# --- Terraform remote state (partial backend config, see terraform/backend.tf) ---
+- name: tfStateResourceGroup
+  value: epicbook-tfstate-rg
+- name: tfStateStorageAccount
+  value: epicbooktfstate5200
+- name: tfStateContainer
+  value: tfstate
+- name: tfStateKey
+  value: epicbook.tfstate
 
-- script: |
-    echo Add other tasks to build, test, and deploy your project.
-    echo See https://aka.ms/yaml
-  displayName: 'Run a multi-line script'
+# --- Authentication ---
+# Kept as a plain variable (NOT in a variable group): a task's azureSubscription
+# input is resolved at compile time, before variable groups are loaded.
+- name: azureServiceConnection
+  value: azure-epicbook-connection
+
+# --- Tooling ---
+# Must satisfy required_version (">= 1.5.0") in terraform/providers.tf.
+- name: terraformVersion
+  value: 1.14.3
+
+# --- Non-secret inputs, editable without a commit (CIDR format, see variables.tf) ---
+- name: adminIp
+  value: 102.90.115.60/32        # PLACEHOLDER: your admin IP -> TF_VAR_allowed_admin_ip
+- name: pipelineAgentIp
+  value: 3.87.75.34/32        # PLACEHOLDER: self-hosted agent's public IP -> TF_VAR_pipeline_agent_ip
+
+# --- Secrets: must contain dbAdminUsername and dbAdminPassword ---
+- group: Epicbook-mysql-secrets
+
+stages:
+
+# ---------------------------------------------------------------------------
+# STAGE 1: Validate - formatting and configuration checks
+# ---------------------------------------------------------------------------
+- stage: Validate
+  displayName: 'Validate Terraform'
+  jobs:
+  - job: Validate
+    displayName: 'Format check and validate'
+    workspace:
+      clean: all              # never reuse files from a previous run
+    steps:
+    - checkout: self
+
+    - script: |
+        set -euo pipefail
+        command -v az || curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+        az version
+      displayName: 'Ensure Azure CLI is installed'
+
+    - script: |
+        set -euo pipefail
+        command -v unzip || sudo apt-get install -y unzip
+        rm -rf terraform.zip tf_install
+        curl -fsSL https://releases.hashicorp.com/terraform/$(terraformVersion)/terraform_$(terraformVersion)_linux_amd64.zip -o terraform.zip
+        mkdir tf_install
+        unzip -o terraform.zip -d tf_install
+        sudo mv tf_install/terraform /usr/local/bin/terraform
+        rm -rf tf_install terraform.zip
+        terraform version
+      displayName: 'Install Terraform $(terraformVersion)'
+      workingDirectory: $(Agent.TempDirectory)   # keep clear of the repo's terraform/ folder
+
+    - task: AzureCLI@2
+      displayName: 'Terraform init, fmt -check, validate'
+      inputs:
+        azureSubscription: ${{ variables.azureServiceConnection }}
+        scriptType: bash
+        scriptLocation: inlineScript
+        addSpnToEnvironment: true
+        workingDirectory: $(Build.SourcesDirectory)/terraform
+        inlineScript: |
+          set -euo pipefail
+          export ARM_CLIENT_ID="$servicePrincipalId"
+          export ARM_TENANT_ID="$tenantId"
+          export ARM_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+          if [ -n "${servicePrincipalKey:-}" ]; then
+            export ARM_CLIENT_SECRET="$servicePrincipalKey"
+          else
+            export ARM_USE_OIDC=true
+            export ARM_OIDC_TOKEN="$idToken"
+          fi
+
+          echo "##[section]terraform init"
+          terraform init -input=false \
+            -backend-config="resource_group_name=$(tfStateResourceGroup)" \
+            -backend-config="storage_account_name=$(tfStateStorageAccount)" \
+            -backend-config="container_name=$(tfStateContainer)" \
+            -backend-config="key=$(tfStateKey)"
+
+          echo "##[section]terraform fmt -check"
+          if ! terraform fmt -check -recursive -diff; then
+            echo "##vso[task.logissue type=error]Formatting problems found. Run 'terraform fmt -recursive' locally and commit the result."
+            exit 1
+          fi
+
+          echo "##[section]terraform validate"
+          if ! terraform validate; then
+            echo "##vso[task.logissue type=error]terraform validate failed. See the errors above."
+            exit 1
+          fi
+
+# ---------------------------------------------------------------------------
+# STAGE 2: Plan - produce a saved plan for review and for Apply
+# ---------------------------------------------------------------------------
+- stage: Plan
+  displayName: 'Terraform Plan'
+  dependsOn: Validate
+  jobs:
+  - job: Plan
+    displayName: 'Create plan'
+    workspace:
+      clean: all
+    steps:
+    - checkout: self
+
+    # Each stage runs as a separate job, possibly on a different agent or a
+    # cleaned workspace, so nothing from earlier stages (installed Terraform,
+    # .terraform/ providers, backend init) can be relied on: reinstall and re-init.
+    - script: |
+        set -euo pipefail
+        command -v az || curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+        az version
+      displayName: 'Ensure Azure CLI is installed'
+
+    - script: |
+        set -euo pipefail
+        command -v unzip || sudo apt-get install -y unzip
+        rm -rf terraform.zip tf_install
+        curl -fsSL https://releases.hashicorp.com/terraform/$(terraformVersion)/terraform_$(terraformVersion)_linux_amd64.zip -o terraform.zip
+        mkdir tf_install
+        unzip -o terraform.zip -d tf_install
+        sudo mv tf_install/terraform /usr/local/bin/terraform
+        rm -rf tf_install terraform.zip
+        terraform version
+      displayName: 'Install Terraform $(terraformVersion)'
+      workingDirectory: $(Agent.TempDirectory)
+
+    - task: AzureCLI@2
+      displayName: 'Terraform init and plan'
+      inputs:
+        azureSubscription: ${{ variables.azureServiceConnection }}
+        scriptType: bash
+        scriptLocation: inlineScript
+        addSpnToEnvironment: true
+        workingDirectory: $(Build.SourcesDirectory)/terraform
+        inlineScript: |
+          set -euo pipefail
+          export ARM_CLIENT_ID="$servicePrincipalId"
+          export ARM_TENANT_ID="$tenantId"
+          export ARM_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+          if [ -n "${servicePrincipalKey:-}" ]; then
+            export ARM_CLIENT_SECRET="$servicePrincipalKey"
+          else
+            export ARM_USE_OIDC=true
+            export ARM_OIDC_TOKEN="$idToken"
+          fi
+
+          terraform init -input=false \
+            -backend-config="resource_group_name=$(tfStateResourceGroup)" \
+            -backend-config="storage_account_name=$(tfStateStorageAccount)" \
+            -backend-config="container_name=$(tfStateContainer)" \
+            -backend-config="key=$(tfStateKey)"
+
+          # pipeline.tfvars holds only non-secret values. Secrets and IPs arrive
+          # as TF_VAR_* environment variables from the env: block below.
+          terraform plan -input=false -var-file="pipeline.tfvars" -out=tfplan
+      env:
+        # Secret variables are NOT exposed to scripts unless mapped explicitly.
+        TF_VAR_db_admin_username: $(dbAdminUsername)
+        TF_VAR_db_admin_password: $(dbAdminPassword)
+        TF_VAR_allowed_admin_ip: $(adminIp)
+        TF_VAR_pipeline_agent_ip: $(pipelineAgentIp)
+
+    # Publish ONLY the plan file - never state or .terraform/.
+    # NOTE: a saved plan embeds the values of sensitive variables (including the
+    # DB password), so restrict who can read this pipeline's artifacts.
+    - publish: $(Build.SourcesDirectory)/terraform/tfplan
+      artifact: tfplan
+      displayName: 'Publish tfplan artifact'
+
+# ---------------------------------------------------------------------------
+# STAGE 3: Apply - runs the saved plan after manual approval
+# ---------------------------------------------------------------------------
+- stage: Apply
+  displayName: 'Terraform Apply'
+  dependsOn: Plan
+  jobs:
+  # Deployment job so the approval check configured on the environment
+  # "epicbook-infra-approval" (in the Azure DevOps UI) gates this stage.
+  - deployment: Apply
+    displayName: 'Apply plan (requires approval)'
+    environment: epicbook-infra-approval
+    workspace:
+      clean: all
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          # Deployment jobs do not check out the repo by default.
+          - checkout: self
+
+          - download: current
+            artifact: tfplan
+            displayName: 'Download tfplan artifact'
+
+          - script: |
+              set -euo pipefail
+              cp "$(Pipeline.Workspace)/tfplan/tfplan" "$(Build.SourcesDirectory)/terraform/tfplan"
+            displayName: 'Copy tfplan into terraform/'
+
+          - script: |
+              set -euo pipefail
+              command -v az || curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+              az version
+            displayName: 'Ensure Azure CLI is installed'
+
+          - script: |
+              set -euo pipefail
+              command -v unzip || sudo apt-get install -y unzip
+              rm -rf terraform.zip tf_install
+              curl -fsSL https://releases.hashicorp.com/terraform/$(terraformVersion)/terraform_$(terraformVersion)_linux_amd64.zip -o terraform.zip
+              mkdir tf_install
+              unzip -o terraform.zip -d tf_install
+              sudo mv tf_install/terraform /usr/local/bin/terraform
+              rm -rf tf_install terraform.zip
+              terraform version
+            displayName: 'Install Terraform $(terraformVersion)'
+            workingDirectory: $(Agent.TempDirectory)
+
+          - task: AzureCLI@2
+            displayName: 'Terraform init and apply'
+            inputs:
+              azureSubscription: ${{ variables.azureServiceConnection }}
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              workingDirectory: $(Build.SourcesDirectory)/terraform
+              inlineScript: |
+                set -euo pipefail
+                export ARM_CLIENT_ID="$servicePrincipalId"
+                export ARM_TENANT_ID="$tenantId"
+                export ARM_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+                if [ -n "${servicePrincipalKey:-}" ]; then
+                  export ARM_CLIENT_SECRET="$servicePrincipalKey"
+                else
+                  export ARM_USE_OIDC=true
+                  export ARM_OIDC_TOKEN="$idToken"
+                fi
+
+                terraform init -input=false \
+                  -backend-config="resource_group_name=$(tfStateResourceGroup)" \
+                  -backend-config="storage_account_name=$(tfStateStorageAccount)" \
+                  -backend-config="container_name=$(tfStateContainer)" \
+                  -backend-config="key=$(tfStateKey)"
+
+                # No -var-file needed: all values are baked into the saved plan.
+                terraform apply -input=false tfplan
+
+          - script: |
+              echo "##vso[task.logissue type=error]Terraform apply FAILED. The real error is in the log of the step 'Terraform init and apply' above - open that step for details."
+              echo "Partial changes may exist in Azure; check the resource group and the state before re-running."
+            displayName: 'Apply failed - where to look'
+            condition: failed()
+
+# ---------------------------------------------------------------------------
+# STAGE 4: Outputs - print the values needed by the Ansible/deploy pipelines
+# ---------------------------------------------------------------------------
+- stage: Outputs
+  displayName: 'Terraform Outputs'
+  dependsOn: Apply
+  jobs:
+  - job: Outputs
+    displayName: 'Print outputs'
+    workspace:
+      clean: all
+    steps:
+    - checkout: self
+
+    - script: |
+        set -euo pipefail
+        command -v az || curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+        az version
+      displayName: 'Ensure Azure CLI is installed'
+
+    - script: |
+        set -euo pipefail
+        command -v unzip || sudo apt-get install -y unzip
+        rm -rf terraform.zip tf_install
+        curl -fsSL https://releases.hashicorp.com/terraform/$(terraformVersion)/terraform_$(terraformVersion)_linux_amd64.zip -o terraform.zip
+        mkdir tf_install
+        unzip -o terraform.zip -d tf_install
+        sudo mv tf_install/terraform /usr/local/bin/terraform
+        rm -rf tf_install terraform.zip
+        terraform version
+      displayName: 'Install Terraform $(terraformVersion)'
+      workingDirectory: $(Agent.TempDirectory)
+
+    - task: AzureCLI@2
+      displayName: 'Terraform init and print outputs'
+      inputs:
+        azureSubscription: ${{ variables.azureServiceConnection }}
+        scriptType: bash
+        scriptLocation: inlineScript
+        addSpnToEnvironment: true
+        workingDirectory: $(Build.SourcesDirectory)/terraform
+        inlineScript: |
+          set -euo pipefail
+          export ARM_CLIENT_ID="$servicePrincipalId"
+          export ARM_TENANT_ID="$tenantId"
+          export ARM_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+          if [ -n "${servicePrincipalKey:-}" ]; then
+            export ARM_CLIENT_SECRET="$servicePrincipalKey"
+          else
+            export ARM_USE_OIDC=true
+            export ARM_OIDC_TOKEN="$idToken"
+          fi
+
+          terraform init -input=false \
+            -backend-config="resource_group_name=$(tfStateResourceGroup)" \
+            -backend-config="storage_account_name=$(tfStateStorageAccount)" \
+            -backend-config="container_name=$(tfStateContainer)" \
+            -backend-config="key=$(tfStateKey)"
+
+          # Only these four outputs are printed - nothing sensitive, no state content.
+          echo "app_public_ip        = $(terraform output -raw app_public_ip)"
+          echo "backend_ansible_host = $(terraform output -raw backend_ansible_host)"
+          echo "backend_private_ip   = $(terraform output -raw backend_private_ip)"
+          echo "mysql_fqdn           = $(terraform output -raw mysql_fqdn)"
