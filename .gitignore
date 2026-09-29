@@ -16,6 +16,10 @@ crash.*.log
 *.tfvars
 *.tfvars.json
 
+# Exception: the pipeline's non-sensitive values file IS committed
+# (it must never contain credentials, admin IPs or other secrets).
+!pipeline.tfvars
+
 # Ignore override files as they are usually used to override resources locally and so
 # are not checked in
 override.tf

@@ -42,9 +42,9 @@ variables:
 
 # --- Non-secret inputs, editable without a commit (CIDR format, see variables.tf) ---
 - name: adminIp
-  value: 102.90.115.60/32        # PLACEHOLDER: your admin IP -> TF_VAR_allowed_admin_ip
+  value: 102.90.115.77/32        # PLACEHOLDER: your admin IP -> TF_VAR_allowed_admin_ip
 - name: pipelineAgentIp
-  value: 3.87.75.34/32        # PLACEHOLDER: self-hosted agent's public IP -> TF_VAR_pipeline_agent_ip
+  value: 98.90.195.31/32        # PLACEHOLDER: self-hosted agent's public IP -> TF_VAR_pipeline_agent_ip
 
 # --- Secrets: must contain mysqlAdminUsername and mysqlAdminPassword ---
 - group: Epicbook-mysql-secrets

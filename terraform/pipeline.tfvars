@@ -13,6 +13,16 @@ resource_group_name = "epicbook-rg"
 ssh_public_key_path = "epicbook-key.pub"
 
 # CHANGE ME: must be globally unique in Azure (lowercase letters, digits, hyphens).
-mysql_server_name = "epicbook-mysql-changeme"
+mysql_server_name = "epicbook-db"
 
 db_name = "epicbook"
+
+vm_size              = "Standard_B2ats_v2"
+vm_admin_username    = "azureuser"
+vnet_cidr            = "10.20.0.0/16"
+frontend_subnet_cidr = "10.20.1.0/24"
+backend_subnet_cidr  = "10.20.2.0/24"
+db_subnet_cidr       = "10.20.3.0/24"
+backend_app_port     = 8080
+mysql_sku_name       = "B_Standard_B1ms"
+project_name         = "epicbook"
