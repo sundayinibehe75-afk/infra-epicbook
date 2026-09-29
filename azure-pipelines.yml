@@ -46,7 +46,7 @@ variables:
 - name: pipelineAgentIp
   value: 3.87.75.34/32        # PLACEHOLDER: self-hosted agent's public IP -> TF_VAR_pipeline_agent_ip
 
-# --- Secrets: must contain dbAdminUsername and dbAdminPassword ---
+# --- Secrets: must contain mysqlAdminUsername and mysqlAdminPassword ---
 - group: Epicbook-mysql-secrets
 
 stages:
@@ -189,8 +189,8 @@ stages:
           terraform plan -input=false -var-file="pipeline.tfvars" -out=tfplan
       env:
         # Secret variables are NOT exposed to scripts unless mapped explicitly.
-        TF_VAR_db_admin_username: $(dbAdminUsername)
-        TF_VAR_db_admin_password: $(dbAdminPassword)
+        TF_VAR_db_admin_username: $(mysqlAdminUsername)
+        TF_VAR_db_admin_password: $(mysqlAdminPassword)
         TF_VAR_allowed_admin_ip: $(adminIp)
         TF_VAR_pipeline_agent_ip: $(pipelineAgentIp)
 
