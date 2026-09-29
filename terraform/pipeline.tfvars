@@ -15,7 +15,7 @@ ssh_public_key_path = "epicbook-key.pub"
 # CHANGE ME: must be globally unique in Azure (lowercase letters, digits, hyphens).
 mysql_server_name = "epicbook-db"
 
-db_name = "epicbook"
+db_name = "bookstore"
 
 vm_size              = "Standard_B2ats_v2"
 vm_admin_username    = "azureuser"
